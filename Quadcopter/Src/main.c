@@ -4,7 +4,7 @@
   * Description        : Main program body
   ******************************************************************************
   *
-  * COPYRIGHT(c) 2015 STMicroelectronics
+  * COPYRIGHT(c) 2016 STMicroelectronics
   *
   * Redistribution and use in source and binary forms, with or without modification,
   * are permitted provided that the following conditions are met:
@@ -35,13 +35,18 @@
 
 /* USER CODE BEGIN Includes */
 
+#include <stdio.h>
 #include "hd44780.h"
 #include "math.h"
-#include "VirtualWire.h"
+#include "MPU6050.h"
+
+#define CPU_CLOCK 16000000U
 
 /* USER CODE END Includes */
 
 /* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c2;
+
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim6;
 TIM_HandleTypeDef htim7;
@@ -50,15 +55,25 @@ UART_HandleTypeDef huart3;
 DMA_HandleTypeDef hdma_usart3_tx;
 
 /* USER CODE BEGIN PV */
+/* Private variables ---------------------------------------------------------*/
+struct imu
+{
+    uint8_t accelAddr;
+    uint8_t gyroAddr;
+    uint8_t gyroData[6];
+    uint8_t accelData[6];
+    double accelAngles[3];
+    double gyroAngles[3];
+    double accel[3];
+    double gyro[3];
+    double lastGyro[3];
+    double interval;
+    double result[3];
+};
+typedef struct imu IMU;
 
-uint8_t aRxBuffer;
-uint8_t modbusBuffer[256];
-uint8_t counter = 0;
-uint8_t UserButtonStatus = 0;
-uint8_t buf[6];
-uint16_t test = 0;
-
-uint8_t temp = 0;
+uint8_t IMUTimerOverflowCounter = 0;
+IMU imu;
 
 /*
 uint16_t times[2000];
@@ -85,55 +100,60 @@ if (timesIndex > 1999)
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
+static void MX_I2C2_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM6_Init(void);
 static void MX_TIM7_Init(void);
 static void MX_USART3_UART_Init(void);
 
 /* USER CODE BEGIN PFP */
-
-typedef struct 
-{
-    uint32_t quot;
-    uint8_t rem;
-} divmod10_t;
-
-inline static divmod10_t divmodu10(uint32_t n)
-{
-    divmod10_t res;
-    res.quot = n >> 1;
-    res.quot += res.quot >> 1;
-    res.quot += res.quot >> 4;
-    res.quot += res.quot >> 8;
-    res.quot += res.quot >> 16;
-    uint32_t qq = res.quot;
-    res.quot >>= 3;
-    res.rem = (uint8_t)(n - ((res.quot << 1) + (qq & ~7ul)));
-    if(res.rem > 9)
-    {
-        res.rem -= 10;
-        res.quot++;
-    }
-    return res;
-}
-
-uint8_t *utoa_fast_div(uint32_t value, uint8_t *buffer)
-{
-    buffer += 5;
-    do
-    {
-        divmod10_t res = divmodu10(value);
-        *--buffer = res.rem + 0x30;
-        value = res.quot;
-    }
-    while (value != 0);
-    return buffer;
-}
+/* Private function prototypes -----------------------------------------------*/
+void updateIMUAngles(void);
 
 /* USER CODE END PFP */
 
 /* USER CODE BEGIN 0 */
+void updateIMUAngles(void)
+{
+    // Get accel and gyro data.
+    HAL_I2C_Master_Transmit(&hi2c2, MPU6050_W, &imu.gyroAddr, 1, 10);
+    HAL_I2C_Master_Receive(&hi2c2, MPU6050_R, imu.gyroData, 6, 10);
+    HAL_I2C_Master_Transmit(&hi2c2, MPU6050_W, &imu.accelAddr, 1, 10);
+    HAL_I2C_Master_Receive(&hi2c2, MPU6050_R, imu.accelData, 6, 10);
+    #define WORD(x, y) (int16_t)((x << 8) | (y & 0xff))
+    imu.accel[0] = WORD(imu.accelData[0], imu.accelData[1]);
+    imu.accel[1] = WORD(imu.accelData[2], imu.accelData[3]);
+    imu.accel[2] = WORD(imu.accelData[4], imu.accelData[5]);
+    imu.gyro[0] = WORD(imu.gyroData[2], imu.gyroData[3]) / MPU6050_GYRO_LSB_3;
+    imu.gyro[1] = WORD(imu.gyroData[0], imu.gyroData[1]) / MPU6050_GYRO_LSB_3;
+    
+    // Get accel angles.
+    #define M_RAD 57.295779513082320876798154814105 // 180deg / pi
+    imu.accelAngles[0] = M_RAD * atan(imu.accel[0] / sqrt(pow(imu.accel[1], 2) + pow(imu.accel[2], 2))) * -1;
+    imu.accelAngles[1] = M_RAD * atan(imu.accel[1] / sqrt(pow(imu.accel[0], 2) + pow(imu.accel[2], 2)));
+    
+    // Get gyro angles.
+    imu.interval = ((uint16_t)htim6.Instance->CNT + IMUTimerOverflowCounter * 65536) / (double)CPU_CLOCK;
+    htim6.Instance->CNT = 0;
+    IMUTimerOverflowCounter = 0;
+    for (uint8_t i = 0; i < 2; i++)
+    {
+        imu.result[i] = isnan(imu.result[i]) ? 0 : imu.result[i];
+        imu.gyroAngles[i] = imu.result[i] + (imu.gyro[i] + imu.lastGyro[i]) * (imu.interval / 2.0);
+        imu.lastGyro[i] = imu.gyro[i];
+    }
 
+    // Get complementary filter.
+    #define COMPLEMENTARY_FILTER_K 0.995
+    imu.result[0] = (1.0 - COMPLEMENTARY_FILTER_K) * imu.accelAngles[0] + imu.gyroAngles[0] * COMPLEMENTARY_FILTER_K;
+    imu.result[1] = (1.0 - COMPLEMENTARY_FILTER_K) * imu.accelAngles[1] + imu.gyroAngles[1] * COMPLEMENTARY_FILTER_K;
+}
+
+/* Interrupt handlers --------------------------------------------------------*/
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim6)
+{
+  IMUTimerOverflowCounter++;  
+}
 /* USER CODE END 0 */
 
 int main(void)
@@ -154,95 +174,47 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
+  MX_I2C2_Init();
   MX_TIM1_Init();
   MX_TIM6_Init();
   MX_TIM7_Init();
   MX_USART3_UART_Init();
 
   /* USER CODE BEGIN 2 */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
-  HAL_UART_Receive_IT(&huart3, &aRxBuffer, 1);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-  HAL_TIM_Base_Start_IT(&htim6);
-  vw_rx_start();
-  
-  uint8_t msg[80];
-  uint8_t msglen = 80;
-  uint8_t asd = 0;
-  uint8_t error = 0;
-  uint32_t packetCount = 0;
-  
+  InitMPU6050(&hi2c2);  
   lcd_init();
+  
+  imu.accelAddr = MPU6050_RA_ACCEL_XOUT_H;
+  imu.gyroAddr = MPU6050_RA_GYRO_XOUT_H;
+  imu.lastGyro[0] = 0;
+  imu.lastGyro[1] = 0;
+  
   lcd_goto(1, 0);
-  lcd_puts(utoa_fast_div((uint8_t)-1, buf));
+  lcd_puts("Hello");
+  
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+  
+  uint8_t str[13];
+
+  __HAL_DBGMCU_FREEZE_TIM6();
+  HAL_TIM_Base_Start_IT(&htim6);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-      if (test == 65535)
-      {
-          HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_12);
-          test = 0;
-      }
-      else
-      {
-          test++;
-      }
-      if (vw_get_message(msg, &msglen)) // Non-blocking
-      {
-          packetCount++;
-          if (asd == 0)
-          {
-              temp = msg[0] - 1;
-              asd = 1;
-          } 
-          
-          temp += 1;
-          
-          if (temp != msg[0])
-          {
-              HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);
-              error++;
-              lcd_goto(2, 10);
-              lcd_puts(utoa_fast_div(error, buf));
-              HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
-          }
-          temp = msg[0];
-          HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_1);
-          lcd_goto(2, 0);
-          lcd_puts(utoa_fast_div(packetCount, buf));
-      }
-    if (UserButtonStatus == 1)
-    {
-      //HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
-      UserButtonStatus = 0;
-      HAL_UART_Transmit_DMA(&huart3, modbusBuffer, sizeof(modbusBuffer) / sizeof(*modbusBuffer));
-      counter = 0;
-      htim1.Instance->CCR1 += 10;
-      lcd_goto(1, 0);
-      lcd_puts(utoa_fast_div(htim1.Instance->CCR1, buf));
-    }
-    if (UserButtonStatus == 2)
-    {
-      htim1.Instance->CCR1 = 999;
-      UserButtonStatus = 0;
-    }
-    if (UserButtonStatus == 3)
-    {
-      htim1.Instance->CCR1 = 1499;
-      UserButtonStatus = 0;
-    }
-    if (UserButtonStatus == 4)
-    {
-      htim1.Instance->CCR1 = 1999;
-      UserButtonStatus = 0;
-    }
   /* USER CODE END WHILE */
 
-  /* USER CODE BEGIN 3 */
-
+  /* USER CODE BEGIN 3 */  
+    updateIMUAngles();
+    /*sprintf(str, "%+06.2f,%+06.2f", imu.result[0], imu.accelAngles[0]);
+    HAL_UART_Transmit(&huart3, str, 13, 5);
+    HAL_UART_Transmit(&huart3, "\n", 1, 1);*/
+    sprintf(str, "%+06.2f %+06.2f", imu.result[0], imu.result[1]);
+    lcd_goto(1, 0);
+    lcd_puts(str);
   }
   /* USER CODE END 3 */
 
@@ -277,6 +249,23 @@ void SystemClock_Config(void)
 
   /* SysTick_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(SysTick_IRQn, 0, 0);
+}
+
+/* I2C2 init function */
+void MX_I2C2_Init(void)
+{
+
+  hi2c2.Instance = I2C2;
+  hi2c2.Init.ClockSpeed = 400000;
+  hi2c2.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c2.Init.OwnAddress1 = 0;
+  hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLED;
+  hi2c2.Init.OwnAddress2 = 0;
+  hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLED;
+  hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLED;
+  HAL_I2C_Init(&hi2c2);
+
 }
 
 /* TIM1 init function */
@@ -315,7 +304,7 @@ void MX_TIM1_Init(void)
   HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig);
 
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 999;
+  sConfigOC.Pulse = 0;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
@@ -323,9 +312,10 @@ void MX_TIM1_Init(void)
   sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
   HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1);
 
-  sConfigOC.Pulse = 0;
+  sConfigOC.Pulse = 999;
   HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2);
 
+  sConfigOC.Pulse = 0;
   HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3);
 
   HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4);
@@ -341,7 +331,7 @@ void MX_TIM6_Init(void)
   htim6.Instance = TIM6;
   htim6.Init.Prescaler = 0;
   htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim6.Init.Period = 4999;
+  htim6.Init.Period = 65535;
   HAL_TIM_Base_Init(&htim6);
 
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
@@ -470,38 +460,6 @@ void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart3)
-{
-    __HAL_UART_FLUSH_DRREGISTER(huart3);
-    modbusBuffer[counter++] = aRxBuffer;
-    HAL_UART_Receive_IT(huart3, &aRxBuffer, 1);
-}
-
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
-  if(GPIO_Pin == GPIO_PIN_7)
-  {  
-    UserButtonStatus = 1;
-  }
-  if(GPIO_Pin == GPIO_PIN_3)
-  {  
-    UserButtonStatus = 2;
-  }
-  if(GPIO_Pin == GPIO_PIN_2)
-  {  
-    UserButtonStatus = 3;
-  }
-  if(GPIO_Pin == GPIO_PIN_1)
-  {  
-    UserButtonStatus = 4;
-  }
-}
-
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim6)
-{
-  vw_Int_Handler();    
-}
 
 /* USER CODE END 4 */
 
